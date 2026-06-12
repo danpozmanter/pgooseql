@@ -1,0 +1,8 @@
+[project]
+id = "example.com/pgooseql/crud"
+version = "0.1.0"
+
+[dependencies]
+
+[rust-bindings]
+pgooseql = { path = "../.." }

@@ -1,0 +1,111 @@
+// CRUD, prepared statements, transactions with parameters, COPY,
+// LISTEN/NOTIFY, pooling, migrations, and the Select builder against
+// PostgreSQL from Gossamer via the pgooseql driver.
+// Run with: DATABASE_URL="host=localhost user=me dbname=mydb" gos run src/main.gos
+
+use postgres::register
+use std::database::sql
+use std::{env, errors}
+
+fn str_bytes(s: &String) -> [u8] {
+    let mut out: [u8] = []
+    for i in 0..s.len() {
+        out.push(s.byte_at(i))
+    }
+    out
+}
+
+fn demo(url: &String) -> Result<(), sql::Error> {
+    let mut db = sql::open("postgres", url)?
+
+    db.execute("CREATE TEMP TABLE players (id BIGINT PRIMARY KEY, name TEXT NOT NULL, score BIGINT NOT NULL)", &[])?
+
+    // Insert with positional $N parameters; execute returns rows affected.
+    let inserted = db.execute(
+        "INSERT INTO players VALUES ($1, $2, $3), ($4, $5, $6)",
+        &[sql::Value::Int(1), sql::Value::Text("alice"), sql::Value::Int(90),
+          sql::Value::Int(2), sql::Value::Text("bob"), sql::Value::Int(70)],
+    )?
+    println!("inserted {} rows", inserted)
+
+    // Prepared statement: parse once, execute many.
+    let mut ins = db.prepare("INSERT INTO players VALUES ($1, $2, $3)")?
+    let _ = ins.execute(&[sql::Value::Int(3), sql::Value::Text("carol"), sql::Value::Int(80)])?
+    let _ = ins.execute(&[sql::Value::Int(4), sql::Value::Text("dave"), sql::Value::Int(60)])?
+    ins.close()
+
+    // Query with parameters; walk rows with typed getters.
+    let mut rows = db.query(
+        "SELECT id, name, score FROM players WHERE score >= $1 ORDER BY score DESC",
+        &[sql::Value::Int(75)],
+    )?
+    defer rows.close()
+    while let Some(row) = rows.next_row()? {
+        println!("#{} {} -> {}", row.get_i64("id")?, row.get_text("name")?, row.get_i64("score")?)
+    }
+
+    // Parameterized statements inside a transaction.
+    let mut tx = db.begin()?
+    let bumped = tx.execute_params(
+        "UPDATE players SET score = score + $1 WHERE score < $2",
+        &[sql::Value::Int(15), sql::Value::Int(75)],
+    )?
+    let mut trows = tx.query("SELECT count(*) AS n FROM players WHERE score >= $1", &[sql::Value::Int(75)])?
+    if let Some(row) = trows.next_row()? {
+        println!("in-tx: bumped {} rows, {} now at 75+", bumped, row.get_i64("n")?)
+    }
+    trows.close()?
+    tx.commit()?
+
+    // COPY round trip: bulk in, bulk out.
+    let loaded = db.copy_in(
+        "COPY players (id, name, score) FROM STDIN",
+        &str_bytes("5\terin\t85\n6\tfay\t95\n"),
+    )?
+    println!("copy_in loaded {} rows", loaded)
+    let dump = db.copy_out("COPY (SELECT id, name FROM players WHERE score > 90 ORDER BY id) TO STDOUT")?
+    println!("copy_out bytes: {}", dump.len())
+
+    // LISTEN/NOTIFY: notifications arrive on the listening connection.
+    db.listen("events")?
+    let _ = db.execute("NOTIFY events, 'score-update'", &[])?
+    if let Some(note) = db.poll_notification(2000)? {
+        println!("notified on {}: {}", note.channel, note.payload)
+    }
+    db.unlisten("events")?
+
+    // Select builder renders dialect-ready SQL + binds.
+    let sel = sql::Select::new("players").columns(&["id", "name"]).where_eq("score", sql::Value::Int(95)).order_by("id", true)
+    let q = sel.render()
+    let binds = sel.params()
+    let mut srows = db.query(&q, &binds)?
+    defer srows.close()
+    while let Some(row) = srows.next_row()? {
+        println!("select hit: #{} {}", row.get_i64("id")?, row.get_text("name")?)
+    }
+
+    // Forward-only migrations (idempotent: rerun applies nothing).
+    let applied = sql::migrate::up(&mut db, "migrations")?
+    println!("migrations applied: {}", applied)
+
+    db.close()?
+
+    // Pooling: checkouts return on close.
+    let pool = sql::Pool::open("postgres", url, 4)?
+    let mut pc = pool.acquire()?
+    pc.ping()?
+    pc.close()?
+    println!("pool live: {} idle: {}", pool.live(), pool.idle())
+    Ok(())
+}
+
+fn main() {
+    register()
+    let Some(url) = env::var("DATABASE_URL") else {
+        eprintln!("set DATABASE_URL, e.g. host=localhost user=me dbname=mydb")
+        return
+    }
+    if let Err(e) = demo(&url) {
+        eprintln!("error: {}", e)
+    }
+}
